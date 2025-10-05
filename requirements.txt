@@ -1,0 +1,6 @@
+unsloth
+peft==0.5.0
+bitsandbytes
+trl
+dotenv
+datasets
