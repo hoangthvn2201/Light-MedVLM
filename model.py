@@ -134,6 +134,7 @@ class LightMedVLM(pl.LightningModule):
 
         # System prompt setup
         self.end_sym = "<|im_end|>"
+        self.report_prompt = "<|im_start|>system\nYou are a professional radiologist. Please generate a comprehensive and detailed diagnosis report for this chest xray image.<|im_end|>\n<|im_start|>user\nThe chest X-ray image shows:"
         self.prompt = "<|im_start|>system\nYou are a professional radiologist. Please generate a comprehensive and detailed diagnosis report for this chest xray image.<|im_end|>\n<|im_start|>user\nThe chest X-ray image shows:"
         
     def encode_img(self, images):
@@ -151,11 +152,51 @@ class LightMedVLM(pl.LightningModule):
         atts = torch.ones(inputs.size()[:-1], dtype=torch.long).to(image.device)
         return inputs, atts
 
-    def prompt_wrap(self, img_embeds, atts_img):
+    def prompt_wrap_report(self, img_embeds, atts_img):
         """
         Wrap image embeddings with Qwen-style prompt.
         Format: {prompt_before} <image> {prompt_after}
         """
+        # Full prompt with image placeholder
+        full_prompt = f"{self.report_prompt} <image><|im_end|>\n<|im_start|>assistant\n"
+        
+        batch_size = img_embeds.shape[0]
+        
+        # Split prompt at image placeholder
+        p_before, p_after = full_prompt.split('<image>')
+        
+        # Tokenize prompt parts (no special tokens added)
+        p_before_tokens = self.tokenizer(
+            p_before,
+            return_tensors="pt",
+            add_special_tokens=False
+        ).to(img_embeds.device)
+        
+        p_after_tokens = self.tokenizer(
+            p_after,
+            return_tensors="pt",
+            add_special_tokens=False
+        ).to(img_embeds.device)
+        
+        # Get embeddings using frozen embed_tokens
+        with torch.no_grad():
+            p_before_embeds = self.embed_tokens(p_before_tokens.input_ids).expand(batch_size, -1, -1)
+            p_after_embeds = self.embed_tokens(p_after_tokens.input_ids).expand(batch_size, -1, -1)
+        
+        # Concatenate: [prompt_before] + [image] + [prompt_after]
+        wrapped_img_embeds = torch.cat([p_before_embeds, img_embeds, p_after_embeds], dim=1)
+        
+        # Create attention mask for entire sequence
+        wrapped_atts_img = torch.ones(
+            batch_size, 
+            wrapped_img_embeds.shape[1], 
+            device=img_embeds.device, 
+            dtype=atts_img.dtype
+        )
+        
+        return wrapped_img_embeds, wrapped_atts_img
+
+    def prompt_wrap(self, img_embeds, atts_img):
         # Full prompt with image placeholder
         full_prompt = f"{self.prompt} <image><|im_end|>\n<|im_start|>assistant\n"
         
@@ -194,7 +235,6 @@ class LightMedVLM(pl.LightningModule):
         )
         
         return wrapped_img_embeds, wrapped_atts_img
-
     def forward(self, samples):
         image = samples["image"]
         img_embeds, atts_img = self.encode_img(image)
@@ -274,6 +314,55 @@ class LightMedVLM(pl.LightningModule):
         pixel_values = self.vit_feature_extractor(img, return_tensors="pt").pixel_values
         return pixel_values[0] 
         
+    @torch.no_grad()
+    def inference_report(self, image_paths, 
+                        beam_size=3, 
+                        do_sample=False, 
+                        min_new_tokens=10, 
+                        max_new_tokens=120, 
+                        repetition_penalty=2.0, 
+                        length_penalty=2.0, 
+                        temperature=0):
+        """Generate text from images."""
+        self.eval()
+
+        images = []
+        device = next(self.parameters()).device
+        for image_path in image_paths:
+            with Image.open(image_path) as pil:
+                array = np.array(pil, dtype=np.uint8)
+                if array.shape[-1] != 3 or len(array.shape) != 3:
+                    array = np.array(pil.convert("RGB"), dtype=np.uint8)
+                image = self._parse_image(array)
+                image = image.unsqueeze(0).to(device)
+                images.append(image)
+
+
+        dtype = self.model.dtype
+        
+        img_embeds, atts_img = self.encode_img(images)
+        img_embeds = self.layer_norm(img_embeds)
+
+        img_embeds = img_embeds.to(dtype)
+        img_embeds, atts_img = self.prompt_wrap_report(img_embeds, atts_img)
+
+        outputs = self.model.generate(
+            inputs_embeds=img_embeds,
+            attention_mask=atts_img,
+            num_beams=beam_size,
+            do_sample=do_sample,
+            min_new_tokens=min_new_tokens,
+            max_new_tokens=max_new_tokens,
+            repetition_penalty=repetition_penalty,
+            length_penalty=length_penalty,
+            temperature=temperature,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
+        
+        out = [self.decode(i) for i in outputs]
+        return out
+
     @torch.no_grad()
     def inference(self, image_paths, 
                         beam_size=3, 
