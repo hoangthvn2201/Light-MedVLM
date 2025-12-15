@@ -1,0 +1,11 @@
+lightning
+transformers
+peft
+huggingface_hub
+tqdm
+torch
+numpy
+pillow
+nltk
+rouge-score
+bert-score
